@@ -1,6 +1,6 @@
 # nixpacks.toml
 [phases.setup]
-pkgs = ["uv"]
+nixPkgs = ["...", "uv"]
 
 [phases.build]
 cmd = ["uv sync --no-dev --frozen"]
