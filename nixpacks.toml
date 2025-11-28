@@ -1,0 +1,9 @@
+# nixpacks.toml
+[phases.setup]
+pkgs = ["uv"]
+
+[phases.build]
+cmd = ["uv sync --no-dev --frozen"]
+
+[start]
+cmd = ["uv run python main.py"]
