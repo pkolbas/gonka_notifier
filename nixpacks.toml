@@ -6,4 +6,4 @@ pkgs = ["uv"]
 cmd = ["uv sync --no-dev --frozen"]
 
 [start]
-cmd = ["uv run python main.py"]
+cmd = "uv run python main.py"
