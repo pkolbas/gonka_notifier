@@ -7,13 +7,12 @@ from typing import Dict, Any, Optional
 import httpx
 
 logging.basicConfig(format='%(asctime)s %(levelname)s:%(message)s', level=logging.INFO)
+logging.getLogger('backoff').addHandler(logging.StreamHandler())
 
 
 API_SERVER = os.getenv("API_SERVER")
 BOT_ID = os.getenv("BOT_ID")  # Telegram bot token
 CHAT_ID = os.getenv("CHAT_ID")
-MISSED_PCT_THRESHOLD = float(os.getenv("MISSED_PCT_THRESHOLD", "3.0"))
-PCT_DECIMALS = int(os.getenv("MISSED_PCT_DECIMALS", "2"))  # антидребезг: сколько знаков учитывать
 
 if not API_SERVER or not BOT_ID or not CHAT_ID:
     logging.error("Environment variables API_SERVER, BOT_ID and CHAT_ID must be set")
@@ -42,32 +41,9 @@ async def fetch_report(client: httpx.AsyncClient) -> Dict[str, Any]:
     return resp.json()
 
 
-def safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
-def round_pct(x: Optional[float]) -> Optional[float]:
-    if x is None:
-        return None
-    return round(x, PCT_DECIMALS)
-
-
-def fmt_pct(x: Optional[float]) -> str:
-    if x is None:
-        return "n/a"
-    return f"{x:.{PCT_DECIMALS}f}%"
-
-
 async def monitor() -> None:
     prev_statuses: Dict[str, str] = {}
-
-    # Храним последнее ОТПРАВЛЕННОЕ значение missed% (уже округлённое)
-    last_sent_missed_pct: Optional[float] = None
+    prev_missed_requests: Optional[int] = None
 
     async with httpx.AsyncClient(timeout=10) as client:
         while True:
@@ -82,50 +58,42 @@ async def monitor() -> None:
                     message = check.get("message", "")
                     details = check.get("details", {}) or {}
 
-                    # Игнорируем глючные проверки
-                    if cid in {"consensus_key_match", "validator_in_set"}:
+                    # 1. Пропускаем глючный consensus_key_match
+                    if cid == "consensus_key_match":
                         continue
 
-                    # missed_requests_threshold: уведомлять по росту процента (с антидребезгом)
+                    # 2. Специальная логика для missed_requests_threshold
                     if cid == "missed_requests_threshold":
                         missed = details.get("missed_requests")
                         total = details.get("total_requests")
+                        missed_pct = details.get("missed_percentage")
 
-                        missed_pct_raw = safe_float(details.get("missed_percentage"))
-                        if missed_pct_raw is None:
-                            try:
-                                if isinstance(missed, (int, float)) and isinstance(total, (int, float)) and total:
-                                    missed_pct_raw = (float(missed) / float(total)) * 100.0
-                            except Exception:
-                                missed_pct_raw = None
-
-                        missed_pct = round_pct(missed_pct_raw)
-                        threshold = round_pct(MISSED_PCT_THRESHOLD)
-
-                        # ниже порога — игнорируем полностью и last_sent не трогаем
-                        if missed_pct is None or threshold is None or missed_pct < threshold:
-                            continue
-
-                        # сравниваем только округлённые значения
-                        if last_sent_missed_pct is None or missed_pct > last_sent_missed_pct:
-                            await send_telegram(
-                                f"[missed_requests_threshold] Missed% increased: "
-                                f"{fmt_pct(last_sent_missed_pct)} -> {fmt_pct(missed_pct)} "
-                                f"(missed={missed}, total={total}, threshold={fmt_pct(threshold)})"
-                            )
-                            last_sent_missed_pct = missed_pct
-
+                        if isinstance(missed, int) and prev_missed_requests is not None:
+                            if missed > prev_missed_requests:
+                                await send_telegram(
+                                    f"[missed_requests_threshold] Missed requests increased: "
+                                    f"{prev_missed_requests} -> {missed} "
+                                    f"(total={total}, missed%={missed_pct})"
+                                )
+                        if isinstance(missed, int):
+                            prev_missed_requests = missed
                         continue
 
-                    # Остальные проверки: уведомление при переходе в non-PASS
+                    # 3. Все остальные проверки:
+                    #    уведомляем, если статус стал отличным от PASS
                     if status != "PASS":
                         prev_status = prev_statuses.get(cid)
+                        # Чтобы не спамить, шлем только при переходе из PASS/unknown в non-PASS
                         if prev_status is None or prev_status == "PASS":
+                            # Отдельный текст для mlnode_*
                             if cid and cid.startswith("mlnode_"):
                                 node_id = details.get("id") or cid.removeprefix("mlnode_")
                                 host = details.get("host", "unknown-host")
-                                await send_telegram(f"[{cid}] ML node problem on {host}/{node_id}: {message}")
+                                await send_telegram(
+                                    f"[{cid}] ML node problem on {host}/{node_id}: {message}"
+                                )
                             else:
+                                # В случае ошибки отправляем ее id и message
                                 await send_telegram(f"[{cid}] {status}: {message}")
 
                     # Обновляем состояние по статусу
